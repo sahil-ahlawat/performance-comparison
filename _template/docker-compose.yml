@@ -1,0 +1,113 @@
+services:
+  # ============================================================================
+  # Services Under Test (Constrained to 0.5 CPU & 128 MB RAM for fair testing)
+  # ============================================================================
+  service-a:
+    build:
+      context: ./service-a
+    container_name: comparison-service-a
+    labels:
+      comparison.role: "service-a"
+      comparison.name: "Service A"
+    ports:
+      - "8081:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 128M
+        reservations:
+          cpus: '0.10'
+          memory: 32M
+    restart: unless-stopped
+
+  service-b:
+    build:
+      context: ./service-b
+    container_name: comparison-service-b
+    labels:
+      comparison.role: "service-b"
+      comparison.name: "Service B"
+    ports:
+      - "8082:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 128M
+        reservations:
+          cpus: '0.10'
+          memory: 32M
+    restart: unless-stopped
+
+  # ============================================================================
+  # Monitoring & Metrics Infrastructure (cAdvisor + Prometheus + Grafana)
+  # ============================================================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.51.0
+    container_name: comparison-cadvisor
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: comparison-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-remote-write-receiver'
+      - '--storage.tsdb.retention.time=1d'
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - cadvisor
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: comparison-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ============================================================================
+  # Automated Load Generator (k6 - Profile: benchmark)
+  # ============================================================================
+  load-tester:
+    image: grafana/k6:0.53.0
+    container_name: comparison-k6
+    profiles: ["benchmark"]
+    environment:
+      - K6_PROMETHEUS_RW_SERVER_URL=http://prometheus:9090/api/v1/write
+      - K6_PROMETHEUS_RW_TREND_STATS=p(50),p(95),p(99),min,max,avg
+      - SERVICE_A_URL=http://service-a:8080/bench
+      - SERVICE_B_URL=http://service-b:8080/bench
+      - TEST_SCENARIO=${TEST_SCENARIO:-stress}
+    volumes:
+      - ./load-generator/benchmark.js:/benchmark.js:ro
+    command: run -o experimental-prometheus-rw /benchmark.js
+    depends_on:
+      - service-a
+      - service-b
+      - prometheus
